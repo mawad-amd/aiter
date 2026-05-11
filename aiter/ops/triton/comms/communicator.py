@@ -148,13 +148,12 @@ class AiterCommunicator:
 
             if self._workspace is None:
                 self._workspace = self._shmem.ccl.all_reduce_preamble(
-                    input_buf, input_buf
+                    out, input_buf
                 )
             self._workspace = self._shmem.ccl.all_reduce(
-                input_buf, input_buf, workspace=self._workspace, async_op=True
+                out, input_buf, workspace=self._workspace, async_op=True
             )
 
-            out.copy_(input_buf)
             return out
         except Exception as e:
             logger.error(
