@@ -128,16 +128,16 @@ class AiterCommunicator:
         if self._buf_shape != shape or self._buf_dtype != dtype:
             assert self._shmem is not None
             self._input_buf = self._shmem.empty(shape, dtype=dtype)
+            self._output_buf = torch.empty(shape, dtype=dtype, device=self.device)
             self._buf_shape = shape
             self._buf_dtype = dtype
             self._workspace = None
-        return self._input_buf
+        return self._input_buf, self._output_buf
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
         try:
-            out = torch.empty_like(inp)
-            input_buf = self._get_buffers(inp.shape, inp.dtype)
+            input_buf, out = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
             if self._workspace is None:
