@@ -61,11 +61,8 @@ class AiterCommunicator:
         self.max_size = max_size
         self._IS_CAPTURING = False
         self._shmem = None
-        self._workspace = None
-        self._input_buf = None
-        self._output_buf = None
-        self._buf_shape = None
-        self._buf_dtype = None
+        self._buf_cache = {}
+        self._ws_cache = {}
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -126,14 +123,14 @@ class AiterCommunicator:
         return True
 
     def _get_buffers(self, shape, dtype):
-        if self._buf_shape != shape or self._buf_dtype != dtype:
+        key = (shape, dtype)
+        if key not in self._buf_cache:
             assert self._shmem is not None
-            self._input_buf = self._shmem.empty(shape, dtype=dtype)
-            self._output_buf = torch.empty(shape, dtype=dtype, device=self._input_buf.device)
-            self._buf_shape = shape
-            self._buf_dtype = dtype
-            self._workspace = None
-        return self._input_buf, self._output_buf
+            self._buf_cache[key] = (
+                self._shmem.empty(shape, dtype=dtype),
+                torch.empty(shape, dtype=dtype, device=self.device),
+            )
+        return self._buf_cache[key]
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
@@ -141,19 +138,22 @@ class AiterCommunicator:
             input_buf, out = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
-            if self._workspace is None:
-                self._workspace = self._shmem.ccl.all_reduce_preamble(
-                    input_buf, input_buf, config=self._gluon_config
+            key = (inp.shape, inp.dtype)
+            ws = self._ws_cache.get(key)
+            if ws is None:
+                ws = self._shmem.ccl.all_reduce_preamble(
+                    out, input_buf, config=self._gluon_config
                 )
-            self._workspace = self._shmem.ccl.all_reduce(
+                self._ws_cache[key] = ws
+            ws = self._shmem.ccl.all_reduce(
+                out,
                 input_buf,
-                input_buf,
-                workspace=self._workspace,
+                workspace=ws,
                 config=self._gluon_config,
                 async_op=True,
             )
+            self._ws_cache[key] = ws
 
-            out.copy_(input_buf)
             return out
         except Exception as e:
             logger.error(
@@ -168,12 +168,13 @@ class AiterCommunicator:
 
     @contextmanager
     def capture(self):
+        from contextlib import ExitStack
         try:
             self._IS_CAPTURING = True
-            if self._workspace is not None and hasattr(self._workspace, 'capture'):
-                with self._workspace.capture():
-                    yield
-            else:
+            with ExitStack() as stack:
+                for ws in self._ws_cache.values():
+                    if hasattr(ws, 'capture'):
+                        stack.enter_context(ws.capture())
                 yield
         finally:
             self._IS_CAPTURING = False
