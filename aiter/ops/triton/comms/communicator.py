@@ -48,7 +48,7 @@ class AiterCommunicator:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
-    _HEAP_SIZE = 2**33  # 8 GB
+    _HEAP_SIZE = 2**30  # 1 GB
 
     def __init__(
         self,
@@ -63,6 +63,7 @@ class AiterCommunicator:
         self._shmem = None
         self._workspace = None
         self._input_buf = None
+        self._output_buf = None
         self._buf_shape = None
         self._buf_dtype = None
 
@@ -128,30 +129,31 @@ class AiterCommunicator:
         if self._buf_shape != shape or self._buf_dtype != dtype:
             assert self._shmem is not None
             self._input_buf = self._shmem.empty(shape, dtype=dtype)
+            self._output_buf = torch.empty(shape, dtype=dtype, device=self._input_buf.device)
             self._buf_shape = shape
             self._buf_dtype = dtype
             self._workspace = None
-        return self._input_buf
+        return self._input_buf, self._output_buf
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
         try:
-            out = torch.empty_like(inp)
-            input_buf = self._get_buffers(inp.shape, inp.dtype)
+            input_buf, out = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
             if self._workspace is None:
                 self._workspace = self._shmem.ccl.all_reduce_preamble(
-                    out, input_buf, config=self._gluon_config
+                    input_buf, input_buf, config=self._gluon_config
                 )
             self._workspace = self._shmem.ccl.all_reduce(
-                out,
+                input_buf,
                 input_buf,
                 workspace=self._workspace,
                 config=self._gluon_config,
                 async_op=True,
             )
 
+            out.copy_(input_buf)
             return out
         except Exception as e:
             logger.error(
@@ -168,6 +170,10 @@ class AiterCommunicator:
     def capture(self):
         try:
             self._IS_CAPTURING = True
-            yield
+            if self._workspace is not None and hasattr(self._workspace, 'capture'):
+                with self._workspace.capture():
+                    yield
+            else:
+                yield
         finally:
             self._IS_CAPTURING = False
