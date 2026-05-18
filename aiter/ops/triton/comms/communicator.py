@@ -61,8 +61,8 @@ class AiterCommunicator:
         self.max_size = max_size
         self._IS_CAPTURING = False
         self._shmem = None
-        self._workspace = None
         self._buf_cache = {}
+        self._ws_cache = {}
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -129,26 +129,28 @@ class AiterCommunicator:
             input_buf = self._shmem.empty(shape, dtype=dtype)
             output_buf = torch.empty(shape, dtype=dtype, device=input_buf.device)
             self._buf_cache[key] = (input_buf, output_buf)
-            self._workspace = None
         return self._buf_cache[key]
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
         try:
+            key = (inp.shape, inp.dtype)
             input_buf, out = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
-            if self._workspace is None:
-                self._workspace = self._shmem.ccl.all_reduce_preamble(
+            ws = self._ws_cache.get(key)
+            if ws is None:
+                ws = self._shmem.ccl.all_reduce_preamble(
                     out, input_buf, config=self._gluon_config
                 )
-            self._workspace = self._shmem.ccl.all_reduce(
+            ws = self._shmem.ccl.all_reduce(
                 out,
                 input_buf,
-                workspace=self._workspace,
+                workspace=ws,
                 config=self._gluon_config,
                 async_op=True,
             )
+            self._ws_cache[key] = ws
 
             return out
         except Exception as e:
@@ -164,12 +166,13 @@ class AiterCommunicator:
 
     @contextmanager
     def capture(self):
+        from contextlib import ExitStack
         try:
             self._IS_CAPTURING = True
-            if self._workspace is not None and hasattr(self._workspace, 'capture'):
-                with self._workspace.capture():
-                    yield
-            else:
+            with ExitStack() as stack:
+                for ws in self._ws_cache.values():
+                    if ws is not None and hasattr(ws, 'capture'):
+                        stack.enter_context(ws.capture())
                 yield
         finally:
             self._IS_CAPTURING = False
